@@ -18,7 +18,7 @@ The thumbprint of the cert to be imported.
 .EXAMPLE 
 ./ImportSQL.ps1 <certThumbprint>
 
-This will import the cert with the given thumbprint into SQL Server
+This will import the cert with the given thumbprint into SQL Server.
 
 .EXAMPLE
 ./wacs.exe --target manual --host hostname.example.com --installation script --script ".\Scripts\ImportSQL.ps1" --scriptparameters "'{CertThumbprint}'" --certificatestore My --acl-read "NT Service\MSSQLSERVER"
@@ -77,9 +77,6 @@ function Set-SQLCertificate {
     
     # The thumbprint must be in all lowercase, otherwise SQL server doesn't seem to accept it
     Set-ItemProperty -Path $regKey.PSPath -Name "Certificate" -Value $NewCertThumbprint.ToLowerInvariant()
-    
-    # Restart the SQL Server service to apply the changes
-    Restart-Service -Name MSSQLSERVER -Force -ErrorAction Stop
 }
 
 # Check if the certificate exists in the store

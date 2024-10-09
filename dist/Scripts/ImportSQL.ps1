@@ -1,53 +1,122 @@
 <#
 .SYNOPSIS
-Imports a cert from WACS renewal into SQL Server
+Imports a cert with a given thumbprint into SQL Server and sets the necessary permissions on the private key file.
+
 .DESCRIPTION
-Note that this script is intended to be run via the install script plugin from win-acme via the batch script wrapper. As such, we use positional parameters to avoid issues with using a dash in the cmd line. 
+This script imports a certificate with a given thumbprint into SQL Server and sets the necessary permissions on the private key file. 
 
-Proper information should be available here
+The script is intended to be run via the install script plugin from win-acme via the batch script wrapper. As such, we use positional parameters to avoid issues with using a dash in the cmd line.
 
-https://github.com/win-acme/win-acme
+When you set up win-acme via the TUI make sure to set the script parameter value to '{CertThumbprint}' including the single quotes.
+
+.LINK 
+https://github.com/win-acme/win-acme 
 
 .PARAMETER NewCertThumbprint
-The exact thumbprint of the cert to be imported.
-
+The thumbprint of the cert to be imported.
 
 .EXAMPLE 
+./ImportSQL.ps1 <certThumbprint>
 
-ImportSQL.ps1 <certThumbprint>
+This will import the cert with the given thumbprint into SQL Server
 
+.EXAMPLE
 ./wacs.exe --target manual --host hostname.example.com --installation script --script ".\Scripts\ImportSQL.ps1" --scriptparameters "'{CertThumbprint}'" --certificatestore My --acl-read "NT Service\MSSQLSERVER"
 
-.NOTES
+This is an example of how to use the script with win-acme. The script parameters should be set to '{CertThumbprint}' including the single quotes.
 
+.NOTES
+Inspired by 
+https://blogs.infosupport.com/configuring-sql-server-encrypted-connections-using-powershell/ 
+https://blog.wicktech.net/update-sql-ssl-certs/
 #>
+
 param(
-    [Parameter(Position=0,Mandatory=$true)]
+    [Parameter(Position = 0, Mandatory = $true)]
     [string]$NewCertThumbprint
 )
 
-#inspired by https://blogs.infosupport.com/configuring-sql-server-encrypted-connections-using-powershell/
-$CertInStore = Get-ChildItem -Path Cert:\LocalMachine -Recurse | Where-Object {$_.thumbprint -eq $NewCertThumbprint} | Sort-Object -Descending | Select-Object -f 1
-if($CertInStore){
-    try{
-        # 1. Configure the Certificate that SQL Server should use
-        # Locate the "SuperSocketNetLib" registry key that contains the encryption settings; highest 
-        # first in case there are multiple versions.
-        $regKey = (ls "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Microsoft SQL Server" -Recurse | 
-            Where-Object { $_.Name -like '*SuperSocketNetLib' } | Sort-Object -Property Name -Descending)
-        if($regKey -is [Array])
-        {
-            $regKey = $regKey[0]
-            Write-Warning "Multiple SQL instances found in the registry, using ""$($regKey.Name)""."
-        }
-        # The thumbprint must be in all lowercase, otherwise SQL server doesn't seem to accept it?!
-        Set-ItemProperty $regKey.PSPath -Name "Certificate" -Value $NewCertThumbprint.ToLowerInvariant()
-        Restart-Service MSSQLSERVER -Force -ErrorAction Stop
-        "Cert thumbprint set to SQL and service restarted"
-    }catch{
-        "Cert thumbprint was not set successfully"
-        "Error: $($Error[0])"
+# Stop the script on any error
+$ErrorActionPreference = 'Stop'
+
+# Trim any whitespace from the thumbprint
+$NewCertThumbprint = $NewCertThumbprint.Trim()
+
+function Set-CertificatePermission {
+    param($certificate)
+   
+    # Get the path to the private key file
+    $containerName = $certificate.PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName
+    $path = Get-ChildItem -Path $env:AllUsersProfile\Microsoft\Crypto -Recurse -Filter $containerName | Select-Object -Expand FullName
+    
+    # Get the SQL service account
+    $sqlServiceAccount = (Get-WmiObject win32_service -Filter "Name='MSSQLSERVER'").StartName
+    
+    # Grant the SQL service account read access to the private key file
+    $currentAcl = Get-Acl -Path $path
+    $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule($sqlServiceAccount, "Read", "Allow")
+    $currentAcl.AddAccessRule($accessRule)
+    
+    # Set the new ACL
+    Set-Acl -Path $path -AclObject $currentAcl
+}
+
+function Set-SQLCertificate {
+    param($NewCertThumbprint)
+    
+    # Locate the "SuperSocketNetLib" registry key that contains the encryption settings; highest 
+    # first in case there are multiple versions.
+    $regKey = Get-ChildItem "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Microsoft SQL Server" -Recurse | 
+    Where-Object { $_.Name -like '*SuperSocketNetLib' } | 
+    Sort-Object -Property Name -Descending
+    
+    if ($regKey.Count -gt 1) {
+        $regKey = $regKey[0]
+        Write-Warning "Multiple SQL instances found in the registry, using ""$($regKey.Name)""."
     }
-} else {
-    "Cert thumbprint not found in the cert store... which is strange because it should be there."
+    
+    # The thumbprint must be in all lowercase, otherwise SQL server doesn't seem to accept it
+    Set-ItemProperty -Path $regKey.PSPath -Name "Certificate" -Value $NewCertThumbprint.ToLowerInvariant()
+    
+    # Restart the SQL Server service to apply the changes
+    Restart-Service -Name MSSQLSERVER -Force -ErrorAction Stop
+}
+
+# Check if the certificate exists in the store
+$CertInStore = Get-ChildItem -Path Cert:\LocalMachine -Recurse | 
+Where-Object { $_.thumbprint -eq $NewCertThumbprint } | 
+Sort-Object -Descending | 
+Select-Object -First 1
+
+if (!$CertInStore) {
+    Write-Error "The given cert thumbprint $NewCertThumbprint was not found in the cert store. Check the thumbprint and certificate storage and try again."
+}
+
+Write-Output "The following certificate was found in the store: $($CertInStore.FriendlyName)"
+
+# Try to set the certificate in SQL server configuration
+try {
+    Set-SQLCertificate $NewCertThumbprint
+    Write-Output "SQL server configuration was updated"
+}
+catch {
+    Write-Error "The SQL server configuration was not set successfully: $_ $_.ScriptStackTrace"
+}
+
+# Try to set the ACL for the certificate
+try {
+    Set-CertificatePermission $CertInStore
+    Write-Output "The ACL for the certificate was updated"
+}
+catch {
+    Write-Error "Error updating ACL: $_ $_.ScriptStackTrace"
+    Exit
+}
+
+# Restart the SQL service
+try {
+    Restart-Service -Name MSSQLSERVER -Force -ErrorAction Stop
+}
+catch {
+    Write-Error "Error while restarting the SQL server: $_ $_.ScriptStackTrace"
 }
